@@ -1,8 +1,14 @@
 name: Deploy binderwish.com
 
+# Two environments:
+#   main → production: binderwish.com, the production Supabase project, nightly jobs
+#   dev  → staging:    dev.binderwish.pages.dev (private behind Cloudflare Access),
+#                      the separate binderwish-dev Supabase project (repo variables
+#                      DEV_SUPABASE_URL / DEV_SUPABASE_KEY), never indexed, no nightly jobs
+# Release = merge dev into main.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   # Daily rebuild so new sets and TCGPlayer prices stay current.
   # tcgcsv.com refreshes its TCGPlayer mirror around 20:00 UTC.
   schedule:
@@ -14,7 +20,7 @@ permissions:
   issues: write # the nightly card-matching check keeps one issue up to date
 
 concurrency:
-  group: deploy
+  group: deploy-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -32,6 +38,15 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # Staging must never fall back to the production database (the site's built-in
+      # default): refuse to build it until its own Supabase project is configured.
+      - name: Check staging settings
+        if: github.ref_name == 'dev'
+        run: |
+          if [ -z "${{ vars.DEV_SUPABASE_URL }}" ] || [ -z "${{ vars.DEV_SUPABASE_KEY }}" ]; then
+            echo "::error::Set the DEV_SUPABASE_URL and DEV_SUPABASE_KEY repository variables (the binderwish-dev Supabase project) before deploying staging."
+            exit 1
+          fi
       # `prebuild` runs scripts/sync-tcgplayer.mjs to refresh the TCGPlayer catalog.
       # No 404.html on purpose: Cloudflare Pages then serves the app for every path.
       - run: npm run build
@@ -41,31 +56,54 @@ jobs:
           VITE_WAITLIST_ENDPOINT: ${{ vars.WAITLIST_ENDPOINT }}
           # Set the ACCOUNTS repo variable to "on" to show sign-in (needs custom SMTP in Supabase).
           VITE_ACCOUNTS: ${{ vars.ACCOUNTS }}
+          # Staging talks to its own Supabase project; production uses the site's defaults.
+          VITE_SUPABASE_URL: ${{ github.ref_name == 'dev' && vars.DEV_SUPABASE_URL || '' }}
+          VITE_SUPABASE_KEY: ${{ github.ref_name == 'dev' && vars.DEV_SUPABASE_KEY || '' }}
+      # Staging: keep search engines out (no sitemap, robots.txt disallows everything,
+      # a noindex header on every page) and let its pages reach the dev database.
+      - name: Prepare staging build
+        if: github.ref_name == 'dev'
+        env:
+          DEV_URL: ${{ vars.DEV_SUPABASE_URL }}
+        run: |
+          printf 'User-agent: *\nDisallow: /\n' > dist/robots.txt
+          rm -f dist/sitemap.xml
+          node scripts/staging-headers.mjs dist/_headers
+          grep -n "X-Robots-Tag\|supabase" dist/_headers | cut -c1-160
+      # main deploys to production (binderwish.com); dev to the dev.binderwish.pages.dev preview.
       - name: Deploy to Cloudflare Pages
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
           npx --yes wrangler@4 pages project create binderwish --production-branch=main || true
-          npx --yes wrangler@4 pages deploy dist --project-name=binderwish --branch=main --commit-dirty=true
+          npx --yes wrangler@4 pages deploy dist --project-name=binderwish --branch=${{ github.ref_name }} --commit-dirty=true
 
       # Supabase pauses free projects after about a week with no activity, which
       # would break sign-in and sync. The daily build touches both the sign-in
       # service and the database so the project never goes idle. Uses the same
       # public (publishable) key the website ships with; never fails the deploy.
       - name: Keep Supabase active
+        if: github.ref_name == 'main'
         continue-on-error: true
         env:
           SUPABASE_URL: https://tbissnuzjfjuvjwtseza.supabase.co
           SUPABASE_KEY: sb_publishable_d9GuSWBWrka2KDNgUF1N0w_e0cAsznX
+          # The staging project would pause too — keep it awake from the nightly run.
+          DEV_URL: ${{ vars.DEV_SUPABASE_URL }}
+          DEV_KEY: ${{ vars.DEV_SUPABASE_KEY }}
         run: |
           curl -sS -o /dev/null -w "auth: %{http_code}\n" "$SUPABASE_URL/auth/v1/settings" -H "apikey: $SUPABASE_KEY"
           curl -sS -o /dev/null -w "database: %{http_code} (401 is expected — the request still reaches it)\n" "$SUPABASE_URL/rest/v1/collections?select=user_id&limit=1" -H "apikey: $SUPABASE_KEY"
+          if [ -n "$DEV_URL" ]; then
+            curl -sS -o /dev/null -w "staging auth: %{http_code}\n" "$DEV_URL/auth/v1/settings" -H "apikey: $DEV_KEY"
+            curl -sS -o /dev/null -w "staging database: %{http_code}\n" "$DEV_URL/rest/v1/collections?select=user_id&limit=1" -H "apikey: $DEV_KEY"
+          fi
 
       # Price alerts (scripts/check-alerts.mjs): compares every active alert with the
       # prices this build just synced and emails one digest per collector. Needs the
       # repository secrets SUPABASE_SECRET_KEY (Supabase → Project Settings → API Keys →
       # secret key) and RESEND_API_KEY; skipped until they're set. Nightly only.
       - name: Send price alerts
-        if: github.event_name != 'push'
+        if: github.ref_name == 'main' && github.event_name != 'push'
         continue-on-error: true
         env:
           SUPABASE_URL: https://tbissnuzjfjuvjwtseza.supabase.co
@@ -81,13 +119,13 @@ jobs:
       # Skipped on pushes; never fails the deploy.
       - name: Check card matching
         id: matching
-        if: github.event_name != 'push'
+        if: github.ref_name == 'main' && github.event_name != 'push'
         continue-on-error: true
         run: |
           node scripts/check-matching.mjs --out matching-report.md
           cat matching-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Report card matching
-        if: github.event_name != 'push' && steps.matching.outputs.problems != '' && steps.matching.outputs.problems != 'error'
+        if: github.ref_name == 'main' && github.event_name != 'push' && steps.matching.outputs.problems != '' && steps.matching.outputs.problems != 'error'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
